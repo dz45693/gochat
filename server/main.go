@@ -13,7 +13,7 @@ import (
 //客户端管理
 type ClientManager struct {
 	//客户端 map 储存并管理所有的长连接client，在线的为true，不在的为false
-	clients map[*Client]bool
+	clients map[string]*Client
 	//web端发送来的的message我们用broadcast来接收，并最后分发给所有的client
 	broadcast chan []byte
 	//新创建的长连接client
@@ -30,6 +30,8 @@ type Client struct {
 	socket *websocket.Conn
 	//发送的消息
 	send chan []byte
+	//服务器IP
+	ip string
 }
 
 //会把Message格式化成json
@@ -38,8 +40,6 @@ type Message struct {
 	Sender    string `json:"sender,omitempty"`    //发送者
 	Recipient string `json:"recipient,omitempty"` //接收者
 	Content   string `json:"content,omitempty"`   //内容
-	ServerIP  string `json:"serverIp,omitempty"`  //实际不需要 验证k8s
-	SenderIP  string `json:"senderIp,omitempty"`  //实际不需要 验证k8s
 }
 
 //创建客户端管理者
@@ -47,49 +47,42 @@ var manager = ClientManager{
 	broadcast:  make(chan []byte),
 	register:   make(chan *Client),
 	unregister: make(chan *Client),
-	clients:    make(map[*Client]bool),
+	clients:    make(map[string]*Client),
 }
 
 func (manager *ClientManager) start() {
 	for {
 		select {
-		//如果有新的连接接入,就通过channel把连接传递给conn
 		case conn := <-manager.register:
-			//把客户端的连接设置为true
-			manager.clients[conn] = true
+			manager.clients[conn.id] = conn
 			//把返回连接成功的消息json格式化
-			jsonMessage, _ := json.Marshal(&Message{Content: "/A new socket has connected. ", ServerIP: LocalIp(), SenderIP: conn.socket.RemoteAddr().String()})
-			//调用客户端的send方法，发送消息
-			manager.send(jsonMessage, conn)
+			jsonMessage, _ := json.Marshal(&Message{Content: "/A new socket has connected. " + conn.ip, Sender: conn.id})
+			manager.send(jsonMessage)
 			//如果连接断开了
 		case conn := <-manager.unregister:
 			//判断连接的状态，如果是true,就关闭send，删除连接client的值
-			if _, ok := manager.clients[conn]; ok {
+			if _, ok := manager.clients[conn.id]; ok {
 				close(conn.send)
-				delete(manager.clients, conn)
-				jsonMessage, _ := json.Marshal(&Message{Content: "/A socket has disconnected. ", ServerIP: LocalIp(), SenderIP: conn.socket.RemoteAddr().String()})
-				manager.send(jsonMessage, conn)
+				delete(manager.clients, conn.id)
+				jsonMessage, _ := json.Marshal(&Message{Content: "/A socket has disconnected. " + conn.ip, Sender: conn.id})
+				manager.send(jsonMessage)
 			}
 			//广播
 		case message := <-manager.broadcast:
-			//遍历已经连接的客户端，把消息发送给他们
-			for conn := range manager.clients {
-				select {
-				case conn.send <- message:
-				default:
-					close(conn.send)
-					delete(manager.clients, conn)
-				}
-			}
+			manager.send(message)
 		}
 	}
 }
 
 //定义客户端管理的send方法
-func (manager *ClientManager) send(message []byte, ignore *Client) {
-	for conn := range manager.clients {
-		//不给屏蔽的连接发送消息
-		if conn != ignore {
+func (manager *ClientManager) send(message []byte) {
+	obj := &Message{}
+	_ = json.Unmarshal(message, obj)
+	for id, conn := range manager.clients {
+		if obj.Sender == id {
+			//continue
+		}
+		if obj.Recipient == conn.id || len(obj.Recipient) < 1 {
 			conn.send <- message
 		}
 	}
@@ -104,7 +97,7 @@ func (c *Client) read() {
 
 	for {
 		//读取消息
-		_, message, err := c.socket.ReadMessage()
+		_, str, err := c.socket.ReadMessage()
 		//如果有错误信息，就注销这个连接然后关闭
 		if err != nil {
 			manager.unregister <- c
@@ -112,7 +105,11 @@ func (c *Client) read() {
 			break
 		}
 		//如果没有错误信息就把信息放入broadcast
-		jsonMessage, _ := json.Marshal(&Message{Sender: c.id, Content: string(message), ServerIP: LocalIp(), SenderIP: c.socket.RemoteAddr().String()})
+		message := &Message{}
+		_ = json.Unmarshal(str, message)
+		message.Sender = c.id
+		jsonMessage, _ := json.Marshal(&message)
+		fmt.Println(fmt.Sprintf("read Id:%s, msg:%s", c.id, string(jsonMessage)))
 		manager.broadcast <- jsonMessage
 	}
 }
@@ -133,6 +130,7 @@ func (c *Client) write() {
 			}
 			//有消息就写入，发送给web端
 			_ = c.socket.WriteMessage(websocket.TextMessage, message)
+			fmt.Println(fmt.Sprintf("write Id:%s, msg:%s", c.id, string(message)))
 		}
 	}
 }
@@ -158,7 +156,7 @@ func wsHandler(res http.ResponseWriter, req *http.Request) {
 	}
 
 	//每一次连接都会新开一个client，client.id通过uuid生成保证每次都是不同的
-	client := &Client{id: uuid.Must(uuid.NewV4(), nil).String(), socket: conn, send: make(chan []byte)}
+	client := &Client{id: uuid.Must(uuid.NewV4(), nil).String(), socket: conn, send: make(chan []byte), ip: LocalIp()}
 	//注册一个新的链接
 	manager.register <- client
 

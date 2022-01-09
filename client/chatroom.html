@@ -7,7 +7,7 @@
             var conn;
             var msg = $("#msg");
             var log = $("#log");
-
+            var recipient =$("#recipient")
             function appendLog(msg) {
                 var d = log[0]
                 var doScroll = d.scrollTop == d.scrollHeight - d.clientHeight;
@@ -24,13 +24,14 @@
                 if (!msg.val()) {
                     return false;
                 }
-                conn.send(msg.val());
+                content= JSON.stringify({"content":msg.val(),"recipient" :recipient.val()})
+                conn.send(content);
                 msg.val("");
                 return false
             });
 
             if (window["WebSocket"]) {
-                conn = new WebSocket("ws://localhost:8011/ws");
+                conn = new WebSocket("ws://localhost:8080/ws");
                 conn.onclose = function(evt) {
                     appendLog($("<div><b>Connection Closed.</b></div>"))
                 }
@@ -83,8 +84,7 @@
 <body>
 <div id="log"></div>
 <form id="form">
-    <input type="submit" value="发送" />
-    <input type="text" id="msg" size="64"/>
+       <label>接受者<label><input type="text" id ="recipient"/> <input type="submit" value="发送" /> <input type="text" id="msg" size="64"/>
 </form>
 </body>
 </html>
