@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"time"
 
+	"github.com/Shopify/sarama"
 	"github.com/gorilla/websocket"
 	uuid "github.com/satori/go.uuid"
 )
@@ -57,7 +61,8 @@ func (manager *ClientManager) start() {
 			manager.clients[conn.id] = conn
 			//把返回连接成功的消息json格式化
 			jsonMessage, _ := json.Marshal(&Message{Content: "/A new socket has connected. " + conn.ip, Sender: conn.id})
-			manager.send(jsonMessage)
+			//manager.send(jsonMessage)
+			syncProducer(jsonMessage)
 			//如果连接断开了
 		case conn := <-manager.unregister:
 			//判断连接的状态，如果是true,就关闭send，删除连接client的值
@@ -65,7 +70,8 @@ func (manager *ClientManager) start() {
 				close(conn.send)
 				delete(manager.clients, conn.id)
 				jsonMessage, _ := json.Marshal(&Message{Content: "/A socket has disconnected. " + conn.ip, Sender: conn.id})
-				manager.send(jsonMessage)
+				//manager.send(jsonMessage)
+				syncProducer(jsonMessage)
 			}
 			//广播
 		case message := <-manager.broadcast:
@@ -110,7 +116,8 @@ func (c *Client) read() {
 		message.Sender = c.id
 		jsonMessage, _ := json.Marshal(&message)
 		fmt.Println(fmt.Sprintf("read Id:%s, msg:%s", c.id, string(jsonMessage)))
-		manager.broadcast <- jsonMessage
+		//manager.broadcast <- jsonMessage
+		syncProducer(jsonMessage)
 	}
 }
 
@@ -139,6 +146,7 @@ func main() {
 	fmt.Println("Starting application...")
 	//开一个goroutine执行开始程序
 	go manager.start()
+	initial()
 	//注册默认路由为 /ws ，并使用wsHandler这个方法
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/health", healthHandler)
@@ -156,7 +164,7 @@ func wsHandler(res http.ResponseWriter, req *http.Request) {
 	}
 
 	//每一次连接都会新开一个client，client.id通过uuid生成保证每次都是不同的
-	client := &Client{id: uuid.Must(uuid.NewV4(), nil).String(), socket: conn, send: make(chan []byte), ip: LocalIp()}
+	client := &Client{id: uuid.Must(uuid.NewV4(),nil).String(), socket: conn, send: make(chan []byte), ip: LocalIp()}
 	//注册一个新的链接
 	manager.register <- client
 
@@ -181,4 +189,109 @@ func LocalIp() string {
 		}
 	}
 	return ip
+}
+
+/////kafka
+
+var topic = "chat"
+var producer sarama.SyncProducer
+
+func initial() {
+	config := sarama.NewConfig()
+	// Version 必须大于等于  V0_10_2_0
+	config.Version = sarama.V0_10_2_1
+	config.Consumer.Return.Errors = true
+	fmt.Println("start connect kafka")
+	// 开始连接kafka服务器
+	address := []string{"192.168.100.30:9092"}
+	client, err := sarama.NewClient(address, config)
+	if err != nil {
+		fmt.Println("connect kafka failed; err", err)
+		return
+	}
+
+	groupId := LocalIp()
+	group, err := sarama.NewConsumerGroupFromClient(groupId, client)
+	if err != nil {
+		fmt.Println("connect kafka failed; err", err)
+		return
+	}
+	go ConsumerGroup(group, []string{topic})
+
+	config = sarama.NewConfig()
+	// 等待服务器所有副本都保存成功后的响应
+	config.Producer.RequiredAcks = sarama.WaitForAll
+	// 随机的分区类型：返回一个分区器，该分区器每次选择一个随机分区
+	config.Producer.Partitioner = sarama.NewRandomPartitioner
+	// 是否等待成功和失败后的响应
+	config.Producer.Return.Successes = true
+	config.Producer.Timeout = 5 * time.Second
+	producer, err = sarama.NewSyncProducer(address, config)
+	if err != nil {
+		log.Printf("sarama.NewSyncProducer err, message=%s \n", err)
+	}
+}
+
+//同生产步消息模式
+func syncProducer(data []byte) {
+	msg := &sarama.ProducerMessage{
+		Topic:     topic,
+		Partition: 0,
+		Value:     sarama.ByteEncoder(data),
+	}
+	partition, offset, err := producer.SendMessage(msg)
+	if err != nil {
+		fmt.Println(fmt.Sprintf("Send message Fail %v", err))
+	}
+	fmt.Printf("send message success topic=%s Partition = %d, offset=%d content:=%s \n", topic, partition, offset ,string(data))
+}
+
+func ConsumerGroup(group sarama.ConsumerGroup, topics []string) {
+	// 检查错误
+	go func() {
+		for err := range group.Errors() {
+			fmt.Println("group errors : ", err)
+		}
+	}()
+	ctx := context.Background()
+	fmt.Println("start get msg")
+	// for 是应对 consumer rebalance
+	for {
+		// 需要监听的主题
+		handler := ConsumerGroupHandler{}
+		// 启动kafka消费组模式，消费的逻辑在上面的 ConsumeClaim 这个方法里
+		err := group.Consume(ctx, topics, handler)
+
+		if err != nil {
+			fmt.Println("consume failed; err : ", err)
+			return
+		}
+	}
+}
+
+type ConsumerGroupHandler struct{}
+
+func (ConsumerGroupHandler) Setup(sess sarama.ConsumerGroupSession) error {
+	//sess.MarkOffset(topic, 0, 0, "")
+	return nil
+}
+
+func (ConsumerGroupHandler) Cleanup(sess sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+// 这个方法用来消费消息的
+func (h ConsumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	// 获取消息
+	for msg := range claim.Messages() {
+		fmt.Printf("kafka receive message %s---Partition:%d, Offset:%d, Key:%s, Value:%s\n", msg.Topic, msg.Partition, msg.Offset, string(msg.Key), string(msg.Value))
+		//发送消息
+		manager.send(msg.Value)
+
+		// 将消息标记为已使用
+		sess.MarkMessage(msg, "")
+		sess.Commit()
+	}
+
+	return nil
 }
