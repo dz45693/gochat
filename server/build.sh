@@ -14,7 +14,7 @@ docker build -t chatserver .
 docker tag  chatserver 192.168.100.30:8080/go/chatserver:2022
 
 docker login -u admin -p '123456' 192.168.100.30:8080
-docker push 192.168.100.30:8080/go/chatserver
+docker push 192.168.100.30:8080/go/chatserver:2022
  
 docker rmi  chatserver
 docker rmi 192.168.100.30:8080/go/chatserver:2022
